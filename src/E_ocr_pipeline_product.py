@@ -1,7 +1,8 @@
 # pip install opencv-python easyocr typing_extensions torch numpy ultralytics pytesseract
-# pip install transformers torchvision Pillow timm
-
+# pip install transformers torchvision Pillow timm requests
 # pytesseract 에 대해서는 별도의 설치가 필요. https://github.com/UB-Mannheim/tesseract/wiki
+
+# -*- coding: utf-8 -*-
 
 import cv2
 import easyocr
@@ -11,25 +12,32 @@ import ssl
 import threading
 import pytesseract
 import hashlib
+import requests
 from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ultralytics import YOLO
 from difflib import SequenceMatcher
 import time
 import json
-from google import genai
 
-import os
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
+os.environ["PYTHONIOENCODING"] = "utf-8"
 
-GEMINI_API_KEY2 = os.environ.get("GEMINI_API_KEY")
+GEMINI_API_KEY2 = os.environ.get("GEMINI_API_KEY2")
 if not GEMINI_API_KEY2:
     raise ValueError("GEMINI_API_KEY 환경변수를 설정해주세요.")
 
-GEMINI_MODEL   = "gemini-2.5-flash"
-_gemini_client = genai.Client(api_key=GEMINI_API_KEY2)
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_URL   = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY2}"
+)
 
 ssl._create_default_https_context = ssl._create_unverified_context
+
 
 # ─────────────────────────────────
 # Tesseract 경로 자동 탐색
@@ -59,8 +67,8 @@ pytesseract.pytesseract.tesseract_cmd = _find_tesseract()
 # ─────────────────────────────────
 EARLY_STOP_MIN_RESULTS  = 5
 EARLY_STOP_CONF_THRESH  = 0.80
-LOW_PERF_CONF_THRESH    = 0.40   # 연속 저성능 버전 판단 기준
-LOW_PERF_CONSECUTIVE    = 2      # 연속 N개 저성능이면 스킵
+LOW_PERF_CONF_THRESH    = 0.40
+LOW_PERF_CONSECUTIVE    = 2
 
 # ─────────────────────────────────
 # 전역 싱글톤: 모델 + MSER
@@ -72,7 +80,7 @@ _MSER       = cv2.MSER_create(delta=5, min_area=60, max_area=14400)
 print("모델 초기화 완료")
 
 # ─────────────────────────────────
-# EasyOCR 결과 캐시 → LRU 방식으로 메모리 누수 방지
+# EasyOCR 결과 캐시 (LRU)
 # ─────────────────────────────────
 class LRUCache(OrderedDict):
     def __init__(self, maxsize=64):
@@ -473,11 +481,6 @@ def run_tesseract(processed_img):
 
 
 def _ocr_one_version(args, stop_flag: threading.Event):
-    """
-    stop_flag가 set되면 즉시 빈 결과 반환.
-    future.cancel()은 이미 실행 중인 스레드를 멈추지 못하므로
-    플래그 방식으로 대체한다.
-    """
     ver_name, processed = args
     if stop_flag.is_set():
         return ver_name, [], []
@@ -489,16 +492,6 @@ def _ocr_one_version(args, stop_flag: threading.Event):
 
 
 def run_ocr_with_early_stop(versions, roi_list):
-    """
-    [BUG FIX] ROI 좌표 이중 보정 수정:
-      기존 코드는 ROI 크롭 결과에 rx1/ry1을 더한 좌표를 all_results에 바로 추가했다.
-      그런데 process_image의 to_global()은 이 all_results 전체에 scale 역변환 + YOLO offset을
-      적용한다. 즉, 버전 OCR 결과(easy/tess)는 to_global()을 거치는 반면,
-      ROI 크롭 결과는 거치지 않아 YOLO offset이 누락되고 scale도 맞지 않는 문제가 있었다.
-
-      수정: ROI 결과도 "크롭+해상도보정 이미지 기준 절대 좌표"로만 변환해서 반환.
-            scale 역변환과 YOLO offset 합산은 process_image의 to_global()에서 일괄 처리.
-    """
     all_results       = []
     version_score_map = {}
     stopped_early     = False
@@ -542,7 +535,6 @@ def run_ocr_with_early_stop(versions, roi_list):
                 stopped_early = True
                 break
 
-    # ── ROI 크롭 OCR (조기 종료되지 않은 경우만) ──────────────
     if not stopped_early:
         if version_score_map:
             best_name = max(version_score_map, key=version_score_map.get)
@@ -561,10 +553,6 @@ def run_ocr_with_early_stop(versions, roi_list):
                 continue
 
             for (bbox, text, conf) in run_easyocr(roi_crop):
-                # [BUG FIX] 크롭 내 좌표(p[0], p[1])에 ROI 오프셋(rx1, ry1)만 더해
-                #   "크롭+해상도보정 이미지 기준 절대 좌표"로 변환.
-                #   scale 역변환 + YOLO offset 합산은 process_image의 to_global()에서 일괄 처리.
-                #   (기존: rx1/ry1 더한 좌표를 all_results에 직접 추가 → to_global() 미적용 경로)
                 adjusted_bbox = [
                     [p[0] + rx1, p[1] + ry1]
                     for p in bbox
@@ -576,6 +564,39 @@ def run_ocr_with_early_stop(versions, roi_list):
             stopped_early = True
 
     return all_results, stopped_early
+
+
+
+# def run_ocr_top4(versions):
+#     """
+#     전처리 버전 중 EasyOCR 평균 신뢰도 상위 4개를 선택해서
+#     EasyOCR + Tesseract 실행
+#     """
+#     # 1단계: 모든 버전 EasyOCR 돌려서 신뢰도 측정
+#     scored = []
+#     for ver_name, processed in versions:
+#         easy = run_easyocr(processed)
+#         avg_conf = (sum(c for _, _, c in easy) / len(easy)) if easy else 0.0
+#         print(f"  [{ver_name}] easy:{len(easy)} avg_conf:{avg_conf:.2f}")
+#         scored.append((avg_conf, ver_name, processed, easy))
+
+#     # 2단계: 신뢰도 내림차순 정렬 후 상위 4개 선택
+#     scored.sort(key=lambda x: x[0], reverse=True)
+#     top4 = scored[:4]
+
+#     print(f"\n  ★ 선택된 상위 4개 버전:")
+#     for avg_conf, ver_name, _, _ in top4:
+#         print(f"    '{ver_name}' (avg_conf={avg_conf:.2f})")
+
+#     # 3단계: 상위 4개 버전으로 Tesseract 추가 실행 + 결과 수집
+#     all_results = []
+#     for avg_conf, ver_name, processed, easy in top4:
+#         tess = run_tesseract(processed)
+#         print(f"  [{ver_name}] tess:{len(tess)}")
+#         all_results.extend(easy)
+#         all_results.extend(tess)
+
+#     return all_results
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -608,9 +629,15 @@ def deduplicate(all_results):
 
         is_dup = False
         for seen in seen_fuzzy:
+            # 기존: 전체 유사도만 비교
             if abs(len(key) - len(seen)) > max(len(key), len(seen)) * 0.3:
                 continue
             if is_similar(key, seen):
+                is_dup = True
+                break
+
+            # 추가: 부분 포함 관계 체크
+            if key in seen or seen in key:
                 is_dup = True
                 break
 
@@ -657,17 +684,12 @@ def merge_by_row(results, y_threshold=20, x_gap_threshold=60):
         for nxt in row_sorted[1:]:
             gap = nxt["x_start"] - current["x_end"]
             if gap < x_gap_threshold:
-                # [BUG FIX] merge_by_row cy 갱신:
-                #   기존: cy를 current["cy"]로 고정 → 병합이 길어질수록 cy가 첫 항목 기준에
-                #         고정되어 행 분리 판단(y_threshold 비교)이 틀어지는 문제.
-                #   수정: cy를 두 항목의 평균으로 점진 갱신.
-                #         (x_end도 nxt 기준으로 갱신 — 기존과 동일하게 유지)
                 current = {
                     "bbox"   : current["bbox"],
                     "text"   : current["text"] + " " + nxt["text"],
                     "conf"   : (current["conf"] + nxt["conf"]) / 2,
                     "cx"     : nxt["cx"],
-                    "cy"     : (current["cy"] + nxt["cy"]) / 2.0,  # ← FIX: 평균 cy 갱신
+                    "cy"     : (current["cy"] + nxt["cy"]) / 2.0,
                     "x_start": current["x_start"],
                     "x_end"  : nxt["x_end"],
                 }
@@ -719,12 +741,11 @@ def calc_dynamic_thresholds(image_h, image_w):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 전체 파이프라인
+# STEP 10. LLM 텍스트 정제 (Gemini REST API)
 # ═══════════════════════════════════════════════════════════════
+
 def remove_similar_duplicates(text: str) -> str:
-    """
-    완전 동일 중복 토큰만 제거. 유사 중복은 LLM에 위임.
-    """
+    """완전 동일 중복 토큰만 제거. 유사 중복은 LLM에 위임."""
     tokens = text.split()
     seen = []
     for t in tokens:
@@ -738,7 +759,6 @@ def refine_with_llm(raw_ocr_text: str, ocr_items: list) -> dict | None:
         print("  [LLM 정제] OCR 텍스트 없음 → 건너뜀")
         return None
 
-    # LLM 호출 전 부분 포함 중복 제거
     preprocessed_text = remove_similar_duplicates(raw_ocr_text)
     print(f"  [중복 전처리] {raw_ocr_text}")
     print(f"           → {preprocessed_text}")
@@ -789,17 +809,32 @@ SK바이오팜, 한독, 동화약품, 삼진제약, 부광약품, 안국약품, 
   "cleaned_text": "노이즈 제거 + 오탈자 교정된 전체 텍스트"
 }}"""
 
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }]
+    }
+
     MAX_RETRIES = 3
     RETRY_DELAY = 5
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             print(f"  Gemini API 호출 중... (시도 {attempt}/{MAX_RETRIES})")
-            response = _gemini_client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
+            response = requests.post(
+                GEMINI_URL,
+                json=payload,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                timeout=30,
             )
-            text = response.text.strip().replace("```json", "").replace("```", "").strip()
+
+            if response.status_code != 200:
+                err = response.json().get("error", {})
+                raise RuntimeError(f"HTTP {response.status_code}: {err.get('message', '')}")
+
+            result = response.json()
+            text   = result["candidates"][0]["content"]["parts"][0]["text"]
+            text   = text.strip().replace("```json", "").replace("```", "").strip()
             parsed = json.loads(text)
 
             print(f"  [LLM 정제 완료]")
@@ -821,7 +856,12 @@ SK바이오팜, 한독, 동화약품, 삼진제약, 부광약품, 안국약품, 
                 return None
 
     return None
-    
+
+
+# ═══════════════════════════════════════════════════════════════
+# 전체 파이프라인
+# ═══════════════════════════════════════════════════════════════
+
 def process_image(image: np.ndarray, bbox: dict = None, save_debug=True, debug_prefix: str = "upload"):
     if image is None:
         return None
@@ -833,17 +873,14 @@ def process_image(image: np.ndarray, bbox: dict = None, save_debug=True, debug_p
     image = correct_perspective(image)
     image = correct_skew(image)
 
-    # ── 2. YOLO 탐지 ──────────────────────────────────────────
-    # ── bbox가 있으면 crop 후 YOLO/MSER 스킵 ──
+    # ── 2. YOLO 탐지 (또는 bbox crop) ─────────────────────────
     if bbox:
         x, y, w, h = bbox["x"], bbox["y"], bbox["w"], bbox["h"]
         image = image[y:y+h, x:x+w]
         print(f"  [bbox crop] x={x} y={y} w={w} h={h}")
-        # YOLO 스킵, 전체 이미지를 단일 영역으로 처리
-        regions = [(0, 0, image.shape[1], image.shape[0], "bbox")]
+        regions      = [(0, 0, image.shape[1], image.shape[0], "bbox")]
         yolo_success = True
     else:
-        # 기존 YOLO 탐지
         print("\n" + "="*55)
         print("STEP 2. YOLO 객체 탐지 (파인튜닝 모델)")
         print("="*55)
@@ -852,8 +889,8 @@ def process_image(image: np.ndarray, bbox: dict = None, save_debug=True, debug_p
     all_ocr_results = []
     class_ocr_map   = defaultdict(list)
 
-    img_h, img_w         = image.shape[:2]
-    y_thr, x_gap, _      = calc_dynamic_thresholds(img_h, img_w)
+    img_h, img_w    = image.shape[:2]
+    y_thr, x_gap, _ = calc_dynamic_thresholds(img_h, img_w)
 
     for idx, (x1, y1, x2, y2, label) in enumerate(regions):
         crop_offset_x = x1
@@ -861,7 +898,7 @@ def process_image(image: np.ndarray, bbox: dict = None, save_debug=True, debug_p
 
         print(f"\n{'='*55}")
         print(f"STEP 3~7: 영역 [{idx+1}: {label}]  "
-            f"크롭 오프셋=({crop_offset_x}, {crop_offset_y})")
+              f"크롭 오프셋=({crop_offset_x}, {crop_offset_y})")
         print("="*55)
 
         cropped = image[y1:y2, x1:x2]
@@ -878,8 +915,8 @@ def process_image(image: np.ndarray, bbox: dict = None, save_debug=True, debug_p
         scale_y = new_h / orig_h if orig_h > 0 else 1.0
         cropped = cropped_resized
 
-        img_h, img_w            = cropped.shape[:2]
-        y_thr, x_gap, y_cluster = calc_dynamic_thresholds(img_h, img_w)
+        img_h, img_w             = cropped.shape[:2]
+        y_thr, x_gap, y_cluster  = calc_dynamic_thresholds(img_h, img_w)
 
         print("\n[5] 전처리 버전 선택 및 생성")
         versions = select_and_build_versions(cropped, diagnosis)
@@ -904,16 +941,20 @@ def process_image(image: np.ndarray, bbox: dict = None, save_debug=True, debug_p
         if stopped:
             print("  → 조기 종료 적용됨")
 
+
+        # print("\n[7] OCR 실행 (상위 4개 버전)")
+        # region_results = run_ocr_top4(versions)
+
         def to_global(bbox):
             return [
                 [int(p[0] / scale_x) + crop_offset_x,
-                int(p[1] / scale_y) + crop_offset_y]
+                 int(p[1] / scale_y) + crop_offset_y]
                 for p in bbox
             ]
 
         region_results_global = [
-            (to_global(bbox), text, conf)
-            for bbox, text, conf in region_results
+            (to_global(b), text, conf)
+            for b, text, conf in region_results
         ]
 
         del versions
@@ -931,7 +972,7 @@ def process_image(image: np.ndarray, bbox: dict = None, save_debug=True, debug_p
 
     deduped  = deduplicate(all_ocr_results)
     merged   = merge_by_row(deduped, y_threshold=y_thr, x_gap_threshold=x_gap)
-    raw_text = " ".join(t for _,t,_ in merged)
+    raw_text = " ".join(t for _, t, _ in merged)
 
     print(f"\n  중복 제거 전: {len(all_ocr_results)}개")
     print(f"  중복 제거 후: {len(deduped)}개")
@@ -972,3 +1013,46 @@ def process_image(image: np.ndarray, bbox: dict = None, save_debug=True, debug_p
         "llm_refined_text" : llm_result.get("product_name") if llm_result else None,
         "llm_result"       : llm_result,
     }
+
+
+# ─────────────────────────────────
+# 실행
+# ─────────────────────────────────
+if __name__ == "__main__":
+    target_image = "product_sample.jpg"
+    image = cv2.imread(target_image)
+    if image is None:
+        print(f"파일 없음: {target_image}")
+    else:
+        result = process_image(image, save_debug=True)
+
+        print("\n" + "="*55)
+        print("최종 결과 요약")
+        print("="*55)
+        if result:
+            print(f"YOLO: {'성공' if result['yolo_success'] else '실패(전체이미지)'}")
+
+            # ── OCR 원문 출력 ──────────────────────────────
+            if not result["yolo_success"]:
+                print(f"\nOCR 전체 원문:\n  {result['raw_ocr_text']}")
+            else:
+                for label, items in result["class_ocr_map"].items():
+                    if label == "full":
+                        continue
+                    print(f"\n[{label}]")
+                    for _, text, conf in items:
+                        print(f"  ({conf:.2f}) {text}")
+
+            # ── LLM 후처리 결과 출력 ───────────────────────
+            print("\n" + "="*55)
+            print("STEP 10. Gemini LLM 후처리 결과")
+            print("="*55)
+
+            llm_result = result.get("llm_result")
+            if llm_result:
+                print(f"\n  제품명      : {llm_result.get('product_name', 'N/A')}")
+                print(f"  브랜드      : {llm_result.get('brand', 'N/A')}")
+                print(f"  정제 텍스트 : {llm_result.get('cleaned_text', 'N/A')}")
+            else:
+                print("  Gemini 후처리 실패 → OCR 원문을 그대로 사용합니다")
+                print(f"  원문: {result['raw_ocr_text']}")

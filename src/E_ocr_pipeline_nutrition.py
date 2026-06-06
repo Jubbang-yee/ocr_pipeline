@@ -143,7 +143,6 @@ def correct_skew(image):
 
 # ═══════════════════════════════════════════════════════════════
 # STEP 4. 진단 기반 전처리
-# PaddleOCR이 자체 전처리를 하므로 반사/블러 등 심각한 경우만 보정
 # ═══════════════════════════════════════════════════════════════
 
 def apply_glare_removal(gray):
@@ -157,10 +156,6 @@ def apply_unsharp_mask(gray, sigma=3.0, strength=1.8):
     return cv2.addWeighted(gray, strength, blur, -(strength-1), 0)
 
 def preprocess_for_paddle(image, diagnosis):
-    """
-    PaddleOCR용 전처리: 심각한 문제만 보정 후 BGR로 반환
-    PaddleOCR 내부에서 CLAHE, 이진화 등은 자체 처리하므로 중복 제거
-    """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
     if diagnosis["has_glare"]:
@@ -171,7 +166,6 @@ def preprocess_for_paddle(image, diagnosis):
         gray = apply_unsharp_mask(gray)
         print("  [전처리] 언샤프 마스킹 적용")
 
-    # PaddleOCR은 BGR 3채널 입력
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
 
@@ -229,11 +223,38 @@ def detect_with_yolo(image):
 # STEP 7. PaddleOCR 실행
 # ═══════════════════════════════════════════════════════════════
 
+def merge_split_rows(ocr_results, y_threshold=15):
+    """y좌표가 비슷하고 x좌표가 연속인 bbox 병합"""
+    if not ocr_results:
+        return ocr_results
+
+    merged = []
+    used = set()
+
+    for i, (bbox_i, text_i, conf_i) in enumerate(ocr_results):
+        if i in used:
+            continue
+        cy_i = sum(p[1] for p in bbox_i) / len(bbox_i)
+        cx_end_i = max(p[0] for p in bbox_i)
+
+        for j, (bbox_j, text_j, conf_j) in enumerate(ocr_results):
+            if j <= i or j in used:
+                continue
+            cy_j = sum(p[1] for p in bbox_j) / len(bbox_j)
+            cx_start_j = min(p[0] for p in bbox_j)
+
+            if abs(cy_i - cy_j) < y_threshold and abs(cx_end_i - cx_start_j) < 80:
+                text_i = text_i + text_j
+                conf_i = (conf_i + conf_j) / 2
+                used.add(j)
+
+        merged.append((bbox_i, text_i, conf_i))
+        used.add(i)
+
+    return merged
+
+
 def run_paddleocr(image):
-    """
-    BGR 이미지를 PaddleOCR에 넘겨 텍스트 추출
-    반환값: [(bbox, text, conf), ...]  - y좌표 오름차순 정렬
-    """
     result = paddle_ocr.predict(image)
     if not result:
         print("  [PaddleOCR] 결과 없음")
@@ -249,8 +270,8 @@ def run_paddleocr(image):
                 bbox_list = bbox.tolist() if hasattr(bbox, "tolist") else list(bbox)
                 parsed.append((bbox_list, text.strip(), float(conf)))
 
-    # y좌표 기준 정렬
     parsed.sort(key=lambda x: min(p[1] for p in x[0]))
+    parsed = merge_split_rows(parsed)
 
     avg_conf = sum(c for _, _, c in parsed) / len(parsed) if parsed else 0.0
     print(f"  [PaddleOCR] 검출: {len(parsed)}개  평균conf: {avg_conf:.2f}")
@@ -262,11 +283,6 @@ def run_paddleocr(image):
 # ═══════════════════════════════════════════════════════════════
 
 def group_into_rows(ocr_results, y_threshold=15):
-    """
-    bbox의 y 중심값 기준으로 같은 행끼리 묶고
-    x 순서로 정렬해 행 텍스트 리스트 반환
-    반환값: [{"texts": [...], "cy": float}, ...]
-    """
     if not ocr_results:
         return []
 
@@ -314,91 +330,111 @@ NUTRIENT_KEYWORDS = {
     "비타민C", "비타민D", "비타민E", "비타민K",
     "엽산", "나이아신", "판토텐산", "비오틴",
     "마그네슘", "아연", "셀레늄", "망간", "구리", "요오드", "불소", "크롬",
-    "인", "칼륨", "몰리브덴",
+    "칼륨", "몰리브덴",
     "오메가", "EPA", "DHA",
     "코엔자임", "루테인", "지아잔틴",
     "글루코사민", "콘드로이친",
+    "셀렌", "플라보노이드",
 }
 
 UNIT_PATTERN = re.compile(
-    r'(\d+[\.,]?\d*)\s*(kcal|cal|g|mg|μg|ug|mcg|ml|l|IU|NE|α-TE)',
-    re.IGNORECASE
+    r'(\d+[\.,]?\d*)\s*(kcal|cal|mg|μg|ug|mcg|ml|IU|NE|g)'
 )
 
-def _is_nutrient(text):
-    text_clean = text.strip().replace(" ", "")
-    return any(kw in text_clean for kw in NUTRIENT_KEYWORDS)
-
 def _extract_value(text):
+    # 괄호 안 % 제거
+    text = re.sub(r'\(\s*[\d\.,]+\s*%?\s*\)', '', text)
     match = UNIT_PATTERN.search(text)
     if match:
         return match.group(0).strip()
+    # 단위만 있는 경우 (예: "탄수화물g")
+    unit_only = re.search(r'\b(kcal|cal|g|mg|μg|ug|mcg)\b', text)
+    if unit_only:
+        before = text[:unit_only.start()].strip()
+        num = re.search(r'[\d]+[\.,]?\d*$', before)
+        if num:
+            return num.group(0) + unit_only.group(0)
+        return '0' + unit_only.group(0)
     num_only = re.search(r'\d+[\.,]?\d*', text)
     if num_only:
         return num_only.group(0)
     return None
 
+def clean_ocr_text(text):
+    """OCR 오인식 교정"""
+    text = re.sub(r'(?<=\s)O(?=\s*kcal|g|mg)', '0', text)
+    text = re.sub(r':O\s', ':0 ', text)
+    text = re.sub(r'(\d+)\s*r\b', r'\1mg', text)
+    text = text.replace('ug', 'μg').replace('mcg', 'μg')
+    return text
+
 def parse_nutrition_rows(rows):
-    """
-    행 묶음 리스트 → {"영양소명": "수치+단위"} 딕셔너리로 파싱
+    results = []
+    used_kw = set()
 
-    패턴 A/C: [영양소명] [수치+단위] [%]   → 텍스트 2~3개
-    패턴 B:   [영양소명수치+단위]           → 텍스트 1개 (붙어서 인식된 경우)
-    """
-    nutrition_dict = {}
-
+    # 1단계: 행 단위 파싱 (순서 유지)
     for row in rows:
-        texts     = row["texts"]
-        full_line = " ".join(texts)
+        line = clean_ocr_text(" ".join(row["texts"]))
+        line = re.sub(r'([가-힣])\s([가-힣])', r'\1\2', line)
+        cy   = row["cy"]
 
-        # 패턴 A/C
-        if len(texts) >= 2 and _is_nutrient(texts[0]):
-            value = _extract_value(" ".join(texts[1:]))
-            if value:
-                nutrition_dict[texts[0].strip()] = value
+        for seg in re.split(r'[,，]', line):
+            seg = seg.strip()
+            if not seg:
                 continue
-
-        # 패턴 B
-        if len(texts) == 1 and _is_nutrient(texts[0]):
-            value = _extract_value(texts[0])
-            for kw in NUTRIENT_KEYWORDS:
-                if kw in texts[0]:
-                    if value:
-                        nutrition_dict[kw] = value
+            value = _extract_value(seg)
+            if not value:
+                continue
+            seg_clean = seg.replace(" ", "")
+            for kw in sorted(NUTRIENT_KEYWORDS, key=len, reverse=True):
+                if kw.replace(" ", "") in seg_clean and kw not in used_kw:
+                    results.append((cy, kw, value))
+                    used_kw.add(kw)
                     break
-            continue
 
-        # 키워드가 중간에 있는 경우
-        for kw in NUTRIENT_KEYWORDS:
-            if kw in full_line.replace(" ", ""):
-                value = _extract_value(full_line)
-                if value:
-                    nutrition_dict[kw] = value
-                break
+    # 2단계: 인접 행 2개씩 합쳐서 재파싱 (셀/렌 같은 쪼개진 경우 보완)
+    for i in range(len(rows) - 1):
+        combined = " ".join(rows[i]["texts"]) + " " + " ".join(rows[i+1]["texts"])
+        combined = clean_ocr_text(combined)
+        combined = re.sub(r'([가-힣])\s([가-힣])', r'\1\2', combined)
+        cy = rows[i]["cy"]
 
-    return nutrition_dict
+        for seg in re.split(r'[,，]', combined):
+            seg = seg.strip()
+            if not seg:
+                continue
+            value = _extract_value(seg)
+            if not value:
+                continue
+            seg_clean = seg.replace(" ", "")
+            for kw in sorted(NUTRIENT_KEYWORDS, key=len, reverse=True):
+                if kw.replace(" ", "") in seg_clean and kw not in used_kw:
+                    results.append((cy, kw, value))
+                    used_kw.add(kw)
+                    break
+
+    # y좌표 기준 정렬 후 딕셔너리 변환
+    results.sort(key=lambda x: x[0])
+    return {kw: value for _, kw, value in results}
 
 
 # ═══════════════════════════════════════════════════════════════
 # 전체 파이프라인
 # ═══════════════════════════════════════════════════════════════
 
-
 def process_nutrition_image(image: np.ndarray, bbox: dict = None, save_debug=False):
     if image is None:
         return None
-    
+
     base_name = "upload"
 
     # ── 1. 기하 보정 ──────────────────────────────────────────
     print("\n" + "="*55)
-    print("STEP 1. 기하 보정 (원근 + 기울기)")
+    print("STEP 1. 기하 보정 (기울기)")
     print("="*55)
-    image = correct_perspective(image)
     image = correct_skew(image)
 
     # ── 2. YOLO 탐지 ──────────────────────────────────────────
-    # ── bbox가 있으면 crop 후 YOLO 스킵 ──
     if bbox:
         x, y, w, h = bbox["x"], bbox["y"], bbox["w"], bbox["h"]
         image = image[y:y+h, x:x+w]
@@ -412,7 +448,6 @@ def process_nutrition_image(image: np.ndarray, bbox: dict = None, save_debug=Fal
         regions, yolo_success = detect_with_yolo(image)
 
     all_nutrition = {}
-    y_thr         = None
 
     for idx, (*coords, label) in enumerate(regions):
         x1, y1, x2, y2 = coords
@@ -422,20 +457,16 @@ def process_nutrition_image(image: np.ndarray, bbox: dict = None, save_debug=Fal
 
         cropped = image[y1:y2, x1:x2]
 
-        # [3] 진단
         print("\n[3] 이미지 진단")
         diagnosis = diagnose_image(cropped)
 
-        # [4] 해상도 보장
         print("\n[4] 해상도 보장")
         cropped = ensure_resolution(cropped)
 
-        # 동적 임계값
         img_h, img_w = cropped.shape[:2]
         y_thr = int(np.clip(img_h * 0.015, 10, 60))
         print(f"  [동적 임계값] y_threshold={y_thr}px")
 
-        # [5] 전처리
         print("\n[5] 전처리")
         preprocessed = preprocess_for_paddle(cropped, diagnosis)
 
@@ -443,17 +474,14 @@ def process_nutrition_image(image: np.ndarray, bbox: dict = None, save_debug=Fal
             cv2.imwrite(f"debug_{base_name}_{label}_preprocessed.jpg", preprocessed)
             print(f"  디버그 이미지 저장")
 
-        # [6] PaddleOCR 실행
         print("\n[6] PaddleOCR 실행")
         ocr_results = run_paddleocr(preprocessed)
 
-        # [7] 행 단위 묶기 → 영양성분 파싱
         print("\n[7] 행 단위 묶기 → 영양성분 파싱")
         rows      = group_into_rows(ocr_results, y_threshold=y_thr)
         nutrition = parse_nutrition_rows(rows)
         all_nutrition.update(nutrition)
 
-    # ── 최종 출력 ─────────────────────────────────────────────
     print("\n" + "="*55)
     print("최종 영양성분 추출 결과")
     print("="*55)
@@ -467,3 +495,35 @@ def process_nutrition_image(image: np.ndarray, bbox: dict = None, save_debug=Fal
         "nutrition"    : all_nutrition,
         "yolo_success" : yolo_success,
     }
+
+
+# ─────────────────────────────────
+# 실행
+# ─────────────────────────────────
+if __name__ == "__main__":
+    import sys
+
+    target_image = sys.argv[1] if len(sys.argv) > 1 else "nutrition_sample.jpg"
+
+    image = cv2.imread(target_image)
+    if image is None:
+        print(f"  [오류] 파일 없음: {target_image}")
+    else:
+        h, w = image.shape[:2]
+        if w > 1500:
+            scale = 1500 / w
+            image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            print(f"  이미지 축소: {w}x{h} → {int(w*scale)}x{int(h*scale)}")
+
+        result = process_nutrition_image(image, save_debug=False)
+
+        print("\n" + "="*55)
+        print("최종 결과 요약")
+        print("="*55)
+        if result:
+            print(f"YOLO: {'성공' if result['yolo_success'] else '실패(전체이미지)'}")
+            print("\n[영양성분표]")
+            for nutrient, value in result["nutrition"].items():
+                print(f"  {nutrient:15s}: {value}")
+        else:
+            print("  결과 없음")
