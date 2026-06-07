@@ -118,22 +118,22 @@ def save_results(product_result, nutrition_result, out_path="results/ocr_output.
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
-    print(f"\n  💾 결과 저장 완료: {out_path}")
+    print(f"\n   결과 저장 완료: {out_path}")
 
 
 def print_final_summary(product_result, nutrition_result):
     """최종 결과 요약 출력"""
     print("\n" + "=" * 60)
-    print("  🔍 최종 인식 결과 요약")
+    print("   최종 인식 결과 요약")
     print("=" * 60)
 
     # 제품명 / 브랜드
     llm = (product_result or {}).get("llm_result") or {}
-    print(f"\n  📦 제품명  : {llm.get('product_name', '인식 실패')}")
-    print(f"  🏷️  브랜드  : {llm.get('brand', '인식 실패')}")
+    print(f"\n   제품명  : {llm.get('product_name', '인식 실패')}")
+    print(f"    브랜드  : {llm.get('brand', '인식 실패')}")
 
     # 영양성분표
-    print("\n  🧪 영양성분표")
+    print("\n   영양성분표")
     nutrients = (nutrition_result or {}).get("nutrition") or {}
     if nutrients:
         for k, v in nutrients.items():
