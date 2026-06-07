@@ -1,0 +1,24 @@
+{
+  "product_pipeline": {
+    "llm_result": {
+      "product_name": "프로폴리스 플러스",
+      "brand": "종근당건강",
+      "cleaned_text": "종근당건강 종근당건강 건강 프로폴리스 플러스"
+    },
+    "raw_ocr_text": "종근당건강 종근당건간 건강 프로플리스 폴리스 플러스",
+    "yolo_success": true
+  },
+  "nutrition_pipeline": {
+    "nutrition": {
+      "열량": "0 kcal",
+      "탄수화물": "0g",
+      "단백질": "0g",
+      "지방": "0g",
+      "나트륨": "0mg",
+      "플라보노이드": "20mg",
+      "아연": "8.5 mg",
+      "셀렌": "55 μg"
+    },
+    "yolo_success": true
+  }
+}
