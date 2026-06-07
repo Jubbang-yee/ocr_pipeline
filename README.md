@@ -95,8 +95,8 @@ GEMINI_API_KEY=your_api_key_here
 
 | 파일 | 용도 | 다운로드 |
 |------|------|----------|
-| `best.pt` | 제품명 영역 탐지 | [Google Drive](#) |
-| `nutrition_best.pt` | 영양성분표 탐지 | [Google Drive](#) |
+| `best.pt` | 제품명 영역 탐지 | [Google Drive](https://drive.google.com/file/d/1GpN90Gr--v0LWVS9RzRFOl7DblnCSeZV/view?usp=sharing) |
+| `nutrition_best.pt` | 영양성분표 탐지 | [Google Drive](https://drive.google.com/file/d/1tLfWl0bUVQe5Ln-RcBDfCRD3inTMwcYZ/view?usp=sharing) |
 
 다운로드 후 `src/` 폴더에 위치
 
